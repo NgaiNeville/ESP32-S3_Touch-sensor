@@ -16,12 +16,16 @@
 #include "esp_log.h"
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
+#include "driver/gpio.h"
 
 // Touch version 3 supports multiple sample configurations (i.e. supports frequency hopping),
 // others only have one set of sample configurations.
 #define EXAMPLE_TOUCH_SAMPLE_CFG_NUM        TOUCH_SAMPLE_CFG_NUM  // Up to 'TOUCH_SAMPLE_CFG_NUM'
 #define EXAMPLE_TOUCH_CHANNEL_NUM           4
 #define EXAMPLE_TOUCH_CHAN_INIT_SCAN_TIMES  3
+
+#define LED_PIN38 GPIO_NUM_38
+#define LED_PIN48 GPIO_NUM_48
 
 touch_sensor_handle_t sens_handle = NULL;
 touch_channel_handle_t chan_handle[EXAMPLE_TOUCH_CHANNEL_NUM];
@@ -67,7 +71,7 @@ void Measurment_task(void *pvParameters)
         gettimeofday(&tv_now,NULL);
         int64_t time_us = ((int64_t)tv_now.tv_sec * 1000000L) + tv_now.tv_usec ;
         int64_t time_ms = ((int64_t)tv_now.tv_sec * 1000L) + (tv_now.tv_usec / 1000);
-        ESP_ERROR_CHECK(touch_channel_read_data(chan_handle[i], TOUCH_CHAN_DATA_TYPE_RAW, data));
+        ESP_ERROR_CHECK(touch_channel_read_data(chan_handle[i], TOUCH_CHAN_DATA_TYPE_SMOOTH, data));
         measured_data_t read_data;
         int64_t counts = (int64_t)data[j];
         read_data.seq_nbr = seq;
@@ -94,6 +98,13 @@ void Processing_task(void *pvParameters)
         if(xQueueReceive(xDataqueue, &received_data,portMAX_DELAY) == pdPASS) {
             ESP_LOGI(TAG, "Processing task: mst nbr %lld at %lldms and Value %lld \n", received_data.seq_nbr, received_data.timestamp, received_data.data1);
             //ESP_LOGI(TAG, "---------------------------------------------------- \n");
+            if(received_data.data1 > 40000)
+            {
+                gpio_set_level(LED_PIN48, 1);
+            }
+            else
+            gpio_set_level(LED_PIN48, 0);
+            
         }
     }
 }
@@ -101,13 +112,13 @@ void Processing_task(void *pvParameters)
 
 bool example_touch_on_active_callback(touch_sensor_handle_t sens_handle, const touch_active_event_data_t *event, void *user_ctx)
 {
-    ESP_EARLY_LOGI("touch_callback", "[CH %d] active", (int)event->chan_id);
+    ESP_EARLY_LOGI("touch_callback", "[CH %d] active  @@@@@@@@@@@@@@@\n", (int)event->chan_id);
     return false;
 }
 
 bool example_touch_on_inactive_callback(touch_sensor_handle_t sens_handle, const touch_inactive_event_data_t *event, void *user_ctx)
 {
-    ESP_EARLY_LOGI("touch_callback", "[CH %d] inactive", (int)event->chan_id);
+    ESP_EARLY_LOGI("touch_callback", "[CH %d] inactive  ###############\n", (int)event->chan_id);
     return false;
 }
 
@@ -178,8 +189,8 @@ void app_main(void)
     printf("=================================\n");
 
     /* Step 3: Confiture the default filter for the touch sensor (Note: Touch V1 uses software filter) */
-    //touch_sensor_filter_config_t filter_cfg = TOUCH_SENSOR_DEFAULT_FILTER_CONFIG();
-    //ESP_ERROR_CHECK(touch_sensor_config_filter(sens_handle, &filter_cfg));
+    touch_sensor_filter_config_t filter_cfg = TOUCH_SENSOR_DEFAULT_FILTER_CONFIG();
+    ESP_ERROR_CHECK(touch_sensor_config_filter(sens_handle, &filter_cfg));
 
     /* Step 4: Do the initial scanning to initialize the touch channel data
      * Without this step, the channel data in the first read will be invalid
@@ -187,11 +198,11 @@ void app_main(void)
     example_touch_do_initial_scanning(sens_handle, chan_handle);
 
     /* Step 5: Register the touch sensor callbacks, here only take `active` and `inactive` event for example */
-    /*touch_event_callbacks_t callbacks = {
+    touch_event_callbacks_t callbacks = {
         .on_active = example_touch_on_active_callback,
         .on_inactive = example_touch_on_inactive_callback,
     };
-    ESP_ERROR_CHECK(touch_sensor_register_callbacks(sens_handle, &callbacks, NULL));*/
+    ESP_ERROR_CHECK(touch_sensor_register_callbacks(sens_handle, &callbacks, NULL));
 
     /* Step 6: Enable the touch sensor */
     ESP_ERROR_CHECK(touch_sensor_enable(sens_handle));
@@ -227,6 +238,16 @@ void app_main(void)
     else {
         ESP_LOGI(TAG, "Main: Initialization Error, failed to create Queue \n");
     }
+    
+    gpio_config_t led_conf = {
+        .pin_bit_mask = (1ULL <<LED_PIN48) | (1ULL << LED_PIN38),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&led_conf);
+
     
 
     /* Step8: Print the sampled data of each enabled touch channel */
