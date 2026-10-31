@@ -26,9 +26,15 @@
 
 #define LED_PIN38 GPIO_NUM_38
 #define LED_PIN48 GPIO_NUM_48
+#define BUTTON_GPIO_PIN     GPIO_NUM_0  // Typically the BOOT button on ESP32 DevKits
+#define ESP_INTR_FLAG_DEFAULT 0
+
+static TaskHandle_t button_task_handle = NULL;
 
 touch_sensor_handle_t sens_handle = NULL;
 touch_channel_handle_t chan_handle[EXAMPLE_TOUCH_CHANNEL_NUM];
+uint32_t dropped_samples_count = 0;
+
 typedef struct {
     int64_t seq_nbr;
     int64_t timestamp;
@@ -37,11 +43,14 @@ typedef struct {
 
 SemaphoreHandle_t xHardwaresemaphore = NULL;
 QueueHandle_t xDataqueue = NULL;
+QueueHandle_t xConfigQueue = NULL;
 
 //ESP_STATIC_ASSERT(EXAMPLE_TOUCH_SAMPLE_CFG_NUM <= TOUCH_SAMPLE_CFG_NUM, "sample configuration number exceed the supported number");
 //ESP_STATIC_ASSERT(EXAMPLE_TOUCH_CHANNEL_NUM <= (TOUCH_MAX_CHAN_ID - TOUCH_MIN_CHAN_ID + 1), "touch channel number exceed the max supported number ");
 
 static const char* TAG = "Capacitive_mst";
+#define BIT_ISR_EVENT   (1 << 0)
+#define BIT_QUEUE_EVENT (1 << 1)
 
 // Active threshold to benchmark ratio. (i.e., touch will be activated when data >= benchmark * (1 + ratio))
 static float s_thresh2bm_ratio[EXAMPLE_TOUCH_CHANNEL_NUM] = {
@@ -55,6 +64,83 @@ static int s_channel_id[EXAMPLE_TOUCH_CHANNEL_NUM] = {
     TOUCH_MIN_CHAN_ID + 2,
     TOUCH_MIN_CHAN_ID + 3,
 };
+
+// The ISR must reside in IRAM
+static void IRAM_ATTR button_gpio_isr_handler(void *arg)
+{
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    // Send a notification directly to the button task
+    xTaskNotifyFromISR(button_task_handle,
+                       BIT_ISR_EVENT,               // eAction value (not modifying value, just unblocking)
+                       eSetBits,
+                       &xHigherPriorityTaskWoken);
+
+    // If xHigherPriorityTaskWoken was set to pdTRUE, yield to the higher priority task
+    if (xHigherPriorityTaskWoken == pdTRUE) {
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
+
+// Task handling the button event
+static void button_task(void *pvParameters)
+{
+    uint32_t thread_notification_value;
+    measured_data_t received_data22;
+    uint32_t ulNotifiedValue;
+    int st = 0;
+
+    while (1) 
+    {
+        // Block indefinitely until EITHER the ISR or the Queue event flags are set
+        xTaskNotifyWait(0x00, ULONG_MAX, &ulNotifiedValue, portMAX_DELAY);
+
+        // Check if woken by Hardware Interrupt
+        if(ulNotifiedValue & BIT_ISR_EVENT)
+        {
+            gpio_set_level(LED_PIN48, 0);
+            ESP_LOGI(TAG, "BUTTON pressed^^^^^^^^^^^^^^^^^^^^^^^^^^!");
+        }
+
+        if (ulNotifiedValue & BIT_QUEUE_EVENT) 
+        {
+            while (xQueueReceive(xConfigQueue, &received_data22, 0) == pdTRUE) 
+            {
+                if((received_data22.data1 > 40000)&&(st==0))
+                {
+                    gpio_set_level(LED_PIN48, 1);
+                    ESP_LOGI(TAG, "BUTTON:$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$#######@@@@@@@@!!!!");
+                    st = 1;
+                }
+                if((received_data22.data1 < 40000)&&(st==1))
+                {
+                    st = 0;
+                }
+            }
+        }
+        // Block indefinitely until a notification arrives from the ISR
+        /*BaseType_t xResult = xTaskNotifyWait(0x00,      // Clear no bits on entry
+                                             ULONG_MAX, // Reset the notification value to 0 on exit
+                                             &thread_notification_value,
+                                             portMAX_DELAY);
+
+        if (xResult == pdPASS) {
+            ESP_LOGI(TAG, "Button was pressed and Task woken from ISR.$$$$$$$$#######@@@@@@@@!!!!\n");
+            ESP_LOGI(TAG, "$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$#######@@@@@@@@!!!!");
+           
+            
+        }
+
+        if(xQueueReceive(xConfigQueue, &received_data22,portMAX_DELAY) == pdPASS)
+        {
+                if(received_data22.data1 > 40000)
+                {
+                    gpio_set_level(LED_PIN48, 0);
+                     ESP_LOGI(TAG, "BUTTON:$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$#######@@@@@@@@!!!!");
+                }
+        }*/
+    }
+}
 
 void Measurment_task(void *pvParameters)
 {
@@ -79,10 +165,12 @@ void Measurment_task(void *pvParameters)
         read_data.data1 = counts;
         
         ESP_LOGI(TAG, "measurement_task: Sending measured data to queue.................\n");
-        if(xQueueSend(xDataqueue, &read_data, pdMS_TO_TICKS(20)) !=pdPASS){
-            ESP_LOGI(TAG, "measurement_task: Erroe: queue full, could not send*****************\n");
-        
-        }
+        if(xQueueSend(xDataqueue, &read_data, pdMS_TO_TICKS(20)) !=pdPASS)
+        {
+            dropped_samples_count ++;
+            ESP_LOGI(TAG, " Error: queue full, sample dropped : %ld $$$$$&&&&&&&&&&&&&&&&&&&\n", dropped_samples_count);
+            
+        } 
         seq++;
         vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -97,14 +185,26 @@ void Processing_task(void *pvParameters)
     {
         if(xQueueReceive(xDataqueue, &received_data,portMAX_DELAY) == pdPASS) {
             ESP_LOGI(TAG, "Processing task: mst nbr %lld at %lldms and Value %lld \n", received_data.seq_nbr, received_data.timestamp, received_data.data1);
+            // If the queue is full, wait up to 10 freeRTOS ticks.
+            //if(received_data.data1 > 40000)
+            //{
+                if (xConfigQueue != NULL) 
+                {
+                    xQueueSend(xConfigQueue, &received_data, pdMS_TO_TICKS(10));
+                    // Notify the worker task that data is ready in the queue
+                    xTaskNotify(button_task_handle, BIT_QUEUE_EVENT, eSetBits);
+                }
+           // }
+            
+
             //ESP_LOGI(TAG, "---------------------------------------------------- \n");
-            if(received_data.data1 > 40000)
+           /* if(received_data.data1 > 40000)
             {
                 gpio_set_level(LED_PIN48, 1);
             }
             else
             gpio_set_level(LED_PIN48, 0);
-            
+            vTaskDelay(pdMS_TO_TICKS(54));*/
         }
     }
 }
@@ -150,7 +250,7 @@ static void example_touch_do_initial_scanning(touch_sensor_handle_t sens_handle,
         printf("Touch [CH %d]", s_channel_id[i]);
         /* Generate the default channel configuration and then update the active threshold based on the real benchmark */
         touch_channel_config_t chan_cfg = EXAMPLE_TOUCH_CHAN_CFG_DEFAULT();
-        for (int j = 0; j < EXAMPLE_TOUCH_SAMPLE_CFG_NUM; j++) {
+        for(int j = 0; j < EXAMPLE_TOUCH_SAMPLE_CFG_NUM; j++) {
 #if SOC_TOUCH_SENSOR_VERSION == 1
             // Touch V1 (ESP32) uses absolute threshold.
             chan_cfg.abs_active_thresh[j] = (uint32_t)(benchmark[j] * (1 - s_thresh2bm_ratio[i]));
@@ -248,7 +348,34 @@ void app_main(void)
     };
     gpio_config(&led_conf);
 
-    
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_NEGEDGE,       // Trigger on falling edge (press down)
+        .mode = GPIO_MODE_INPUT,             // Set as input mode
+        .pin_bit_mask = (1ULL << BUTTON_GPIO_PIN),
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_ENABLE      // Internal pull-up enabled
+    };
+    gpio_config(&io_conf);
+
+    // 2. Create the processing task
+    xTaskCreate(button_task, 
+                "button_task", 
+                2048, 
+                NULL, 
+                10,              // High priority to ensure immediate context switch
+                &button_task_handle);
+
+    // 3. Install GPIO ISR service and register the handler
+    gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
+    gpio_isr_handler_add(BUTTON_GPIO_PIN, button_gpio_isr_handler, NULL);
+
+    // Create a queue capable of holding 1 struct instance at a time
+    xConfigQueue = xQueueCreate(1, sizeof(measured_data_t));
+
+    if (xConfigQueue == NULL) {
+        // Handle queue creation failure
+        return;
+    }
 
     /* Step8: Print the sampled data of each enabled touch channel */
     /*uint32_t data[EXAMPLE_TOUCH_SAMPLE_CFG_NUM] = {};
