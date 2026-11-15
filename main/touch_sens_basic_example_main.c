@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 #include "driver/touch_sens.h"
 #include "esp_check.h"
+#include <esp_timer.h>
 #include "touch_sens_example_config.h"
 #include <time.h>
 #include <sys/time.h>
@@ -18,6 +19,7 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 #include "driver/gpio.h"
+#include "freertos/ringbuf.h"
 
 // Touch version 3 supports multiple sample configurations (i.e. supports frequency hopping),
 // others only have one set of sample configurations.
@@ -31,6 +33,13 @@
 #define ESP_INTR_FLAG_DEFAULT 0
 
 #define SAMPLING_PERIOD_MS    20
+
+//ring buffer config
+#define SAMPLES_PER_BATCH    256             // 256 samples per ~100 ms window
+#define BATCH_PERIOD_US      100000          // 100 ms
+#define SAMPLE_PERIOD_US     (BATCH_PERIOD_US / SAMPLES_PER_BATCH) // 390 us (~2.56 kHz)
+#define RINGBUF_BATCH_COUNT  10              // Holds 1 second (10 batches) of data
+
 
 // Signal Processing Hyperparameters
 #define ALPHA_BASE_SLOW       0.0005f           // Super slow filter for environmental drift
@@ -64,6 +73,7 @@ uint32_t dropped_samples_count = 0;
     int64_t data1;
 }measured_data_t;*/
 
+static RingbufHandle_t s_touch_ringbuf = NULL;
 SemaphoreHandle_t xHardwaresemaphore = NULL;
 QueueHandle_t xDataqueue = NULL;
 QueueHandle_t xConfigQueue = NULL;
@@ -89,6 +99,18 @@ static int s_channel_id[EXAMPLE_TOUCH_CHANNEL_NUM] = {
     TOUCH_MIN_CHAN_ID + 2,
     TOUCH_MIN_CHAN_ID + 3,
 };
+
+// ISR callback: strictly notifies the acquisition task every 390 us
+static void IRAM_ATTR sample_timer_isr(void *arg) 
+{
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    vTaskNotifyGiveFromISR(Measurement_task_handle, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+
 
 // The ISR must reside in IRAM
 static void IRAM_ATTR button_gpio_isr_handler(void *arg)
@@ -178,21 +200,21 @@ static void button_task(void *pvParameters)
 
 void Measurement_task(void *pvParameters)
 {
-    measured_data_t read_data;
-    uint32_t data = 0;       //[EXAMPLE_TOUCH_SAMPLE_CFG_NUM] = {};
-    struct timeval tv_now;
-    uint32_t benchmark = 20;
+    //measured_data_t read_data;
+    //uint32_t data = 0;       //[EXAMPLE_TOUCH_SAMPLE_CFG_NUM] = {};
+    //struct timeval tv_now;
+    //uint32_t benchmark = 20;
     //int counts;
     int i = 0;
     //int j = 0;
-    int seq = 1;
+    //int seq = 1;
 
     
-    xQueueReceive(xBenchmarkQueue, &benchmark, 0) ;
-    ESP_LOGI(TAG, " Benchmark = %ld Received via Queue \n", benchmark);
+    //xQueueReceive(xBenchmarkQueue, &benchmark, 0) ;
+    //ESP_LOGI(TAG, " Benchmark = %ld Received via Queue \n", benchmark);
             
 
-    if(touch_channel_read_data(chan_handle[i], TOUCH_CHAN_DATA_TYPE_SMOOTH, &data))
+    /*if(touch_channel_read_data(chan_handle[i], TOUCH_CHAN_DATA_TYPE_SMOOTH, &data))
     {
         //read_data.baseline = (float)data;
         read_data.filtered_signal = (float)data;
@@ -207,35 +229,46 @@ void Measurement_task(void *pvParameters)
     read_data.is_touched = false;
     read_data.seq_nbr = seq;
     read_data.timestamp = 0;
-    read_data.raw_data = data;
+    read_data.raw_data = data;*/
+
+    uint32_t batch_buf[SAMPLES_PER_BATCH];
+    uint16_t sample_idx = 0;
+
+    //start 390us periodic timer when task handle is ready
+    const esp_timer_create_args_t timer_args = {
+        .callback = &sample_timer_isr,
+        .name = "touch_tick_isr",
+        .dispatch_method = ESP_TIMER_ISR
+    };
+    esp_timer_handle_t timer_handle = NULL;
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &timer_handle));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(timer_handle, SAMPLE_PERIOD_US));
 
     while (1) 
     {
-        xQueueReceive(xReturnQueue, &read_data, 0);
-        gettimeofday(&tv_now,NULL);
+        //xQueueReceive(xReturnQueue, &read_data, 0);
+        /*gettimeofday(&tv_now,NULL);
         int64_t time_us = ((int64_t)tv_now.tv_sec * 1000000L) + tv_now.tv_usec ;
-        int64_t time_ms = ((int64_t)tv_now.tv_sec * 1000L) + (tv_now.tv_usec / 1000);
+        int64_t time_ms = ((int64_t)tv_now.tv_sec * 1000L) + (tv_now.tv_usec / 1000);*/
 
-        if(touch_channel_read_data(chan_handle[i], TOUCH_CHAN_DATA_TYPE_RAW, &data) != ESP_OK)
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        uint32_t raw_val = 0;
+        touch_channel_read_data(chan_handle[i], TOUCH_CHAN_DATA_TYPE_RAW, &raw_val);
+        batch_buf[sample_idx++] = raw_val;
+        
+        //after 256th sample, push batch into ring buffer
+        if (sample_idx >= SAMPLES_PER_BATCH)
         {
-            vTaskDelay(pdMS_TO_TICKS(1));
-            continue;
+            BaseType_t sent = xRingbufferSend(s_touch_ringbuf, batch_buf, sizeof(batch_buf), 0);
+            if (sent != pdTRUE) {
+                ESP_LOGW(TAG, "Ring buffer full! Consumer task is falling behind");
+
+            }
+            sample_idx = 0;
+
         }
-        
-        //int64_t counts = (int64_t)data; //[j];
-        //read_data.baseline = data;
-        read_data.seq_nbr = seq;
-        read_data.timestamp = time_ms;
-        read_data.raw_data = data;
-        
-        if(xQueueSend(xDataqueue, &read_data, pdMS_TO_TICKS(0)) !=pdPASS)
-        {
-            dropped_samples_count ++;
-            ESP_LOGI(TAG, " Error: queue full, sample dropped : %ld $$$$$&&&&&&&&&&&&&&&&&&&\n", dropped_samples_count);
-            
-        } 
-        seq++;
-        vTaskDelay(pdMS_TO_TICKS(SAMPLING_PERIOD_MS));
+
     }
 
 
@@ -244,65 +277,94 @@ void Measurement_task(void *pvParameters)
 void Processing_task(void *pvParameters)
 {
     measured_data_t received_data;
+    int i = 0;
+    int seq = 1;
+    size_t item_size = sizeof(uint32_t) * SAMPLES_PER_BATCH;
     uint32_t data;
+
+    if(touch_channel_read_data(chan_handle[i], TOUCH_CHAN_DATA_TYPE_SMOOTH, &data))
+    {
+        //read_data.baseline = (float)data;
+        received_data.filtered_signal = (float)data;
+        received_data.noise_variance = 4.0f; // Initial guess floor (RMS noise = 2.0)
+        received_data.rms_noise = sqrtf(received_data.noise_variance);
+
+    }
+    received_data.baseline = (float)data;
+    received_data.filtered_signal = (float)data;
+    received_data.noise_variance = 4.0f; // Initial guess floor (RMS noise = 2.0)
+    received_data.rms_noise = sqrtf(received_data.noise_variance);
+    received_data.is_touched = false;
+    received_data.seq_nbr = seq;
+    received_data.timestamp = 0;
+    received_data.raw_data = data;
+
     while(1)
     {
-        if(xQueueReceive(xDataqueue, &received_data,portMAX_DELAY) == pdPASS) 
+        uint32_t *batch = (uint32_t *)xRingbufferReceive(s_touch_ringbuf, &item_size, portMAX_DELAY);
+
+        if (batch != NULL)
         {
-            //ESP_LOGI(TAG, "B4-processx  received  Filtrer %6.1f", received_data.filtered_signal);
-            data = received_data.raw_data;
-            // 2. Continual IIR Filtering for responsive touch level estimation
-            received_data.filtered_signal = (ALPHA_SIGNAL * data) + ((1.0f - ALPHA_SIGNAL) * received_data.filtered_signal);
+            size_t count = item_size / sizeof(uint32_t);
+            //ESP_LOGI(TAG, "[Core %d] processed %zu samples | first: %lu, Last: %lu", xPortGetCoreID(), count, batch[0], batch[count - 1]);
+            for(int ts = 0; ts < 256; ts++)
+            {
+                data = batch[ts];
+                // 2. Continual IIR Filtering for responsive touch level estimation
+                received_data.filtered_signal = (ALPHA_SIGNAL * data) + ((1.0f - ALPHA_SIGNAL) * received_data.filtered_signal);
 
-            // Deviation formula: On ESP32-S3, finger touches INCREASE raw capacitance cycles
-            float deviation = (float)data - received_data.baseline;
-            float touch_threshold = NOISE_SIGMA_THRESHOLD * received_data.rms_noise;
+                // Deviation formula: On ESP32-S3, finger touches INCREASE raw capacitance cycles
+                float deviation = (float)data - received_data.baseline;
+                float touch_threshold = NOISE_SIGMA_THRESHOLD * received_data.rms_noise;
 
-            // 3. Conditional State Machine (Sticky Baseline Logic)
-            if (deviation > touch_threshold) {
+                // 3. Conditional State Machine (Sticky Baseline Logic)
+                if (deviation > touch_threshold) {
         
-                // --- PAD TOUCHED ---
+                    // --- PAD TOUCHED ---
                 received_data.is_touched = true;
             
                 // TARGET CRITERIA: Completely skip updating the baseline here.
                 // Because this block executes while a finger remains on the sensor, 
                 // the baseline stays frozen indefinitely, avoiding absorption.
-            } else 
-            {
-                // --- PAD UNTOUCHED / IDLE ---
-                received_data.is_touched = false;
-
-                // Handle baseline drift directionally
-                if (deviation < 0.0f) {
-                    // If raw values fall below baseline, track fast (environmental drop or release recalibration)
-                    received_data.baseline = (ALPHA_BASE_FAST * data) + ((1.0f - ALPHA_BASE_FAST) * received_data.baseline);
                 } else 
                 {
-                    // Natural environmental drift tracking
-                    received_data.baseline = (ALPHA_BASE_SLOW * data) + ((1.0f - ALPHA_BASE_SLOW) * received_data.baseline);
-                }
+                    // --- PAD UNTOUCHED / IDLE ---
+                    received_data.is_touched = false;
 
-                // 4. Update RMS Noise estimation (Variance is only valid when untouched)
-                float current_variance = deviation * deviation;
-                received_data.noise_variance = (ALPHA_NOISE * current_variance) + ((1.0f - ALPHA_NOISE) * received_data.noise_variance);
+                    // Handle baseline drift directionally
+                    if (deviation < 0.0f) {
+                        // If raw values fall below baseline, track fast (environmental drop or release recalibration)
+                        received_data.baseline = (ALPHA_BASE_FAST * data) + ((1.0f - ALPHA_BASE_FAST) * received_data.baseline);
+                    } else 
+                    {
+                        // Natural environmental drift tracking
+                        received_data.baseline = (ALPHA_BASE_SLOW * data) + ((1.0f - ALPHA_BASE_SLOW) * received_data.baseline);
+                    }
+
+                    // 4. Update RMS Noise estimation (Variance is only valid when untouched)
+                    float current_variance = deviation * deviation;
+                    received_data.noise_variance = (ALPHA_NOISE * current_variance) + ((1.0f - ALPHA_NOISE) * received_data.noise_variance);
                 
-                //vTaskDelay(pdMS_TO_TICKS(1));
+                    //vTaskDelay(pdMS_TO_TICKS(1));
 
-                // Guard against noise collapse
-                if (received_data.noise_variance < 0.25f) received_data.noise_variance = 0.25f;
-                received_data.rms_noise = sqrtf(received_data.noise_variance);
+                    // Guard against noise collapse
+                    if (received_data.noise_variance < 0.25f) received_data.noise_variance = 0.25f;
+                    received_data.rms_noise = sqrtf(received_data.noise_variance);
+                }
             }
+                // Telemetry Data Output
+                ESP_LOGI(TAG, "Raw: %4lu |Baseline: %6.1f |Fltrd: %6.1f |ClnSig:%5.1f |RMSNoise: %4.2f |Nbr: %5.1f |at: %lld |[%s]",
+                     data, 
+                     received_data.baseline, 
+                     received_data.filtered_signal,
+                     (received_data.filtered_signal - received_data.baseline), 
+                     received_data.rms_noise,
+                     received_data.seq_nbr,
+                     received_data.timestamp,
+                     received_data.is_touched ? "TOUCHED" : "RELEASED");
 
-            // Telemetry Data Output
-            ESP_LOGI(TAG, "Raw: %4lu |Baseline: %6.1f |Fltrd: %6.1f |ClnSig:%5.1f |RMSNoise: %4.2f |Nbr: %5.1f |at: %lld |[%s]",
-                 data, 
-                 received_data.baseline, 
-                 received_data.filtered_signal,
-                 (received_data.filtered_signal - received_data.baseline), 
-                 received_data.rms_noise,
-                 received_data.seq_nbr,
-                 received_data.timestamp,
-                 received_data.is_touched ? "TOUCHED" : "RELEASED");
+            
+            
 
 
             //ESP_LOGI(TAG, " mst nbr %6.1f at %lldms and Value %6.1f \n", received_data.seq_nbr, received_data.timestamp, received_data.filtered_signal);
@@ -315,12 +377,12 @@ void Processing_task(void *pvParameters)
                     // Notify the worker task that data is ready in the queue
                     xTaskNotify(button_task_handle, BIT_QUEUE_EVENT, eSetBits);
                 }
-            if (xReturnQueue != NULL) 
+             /* if (xReturnQueue != NULL) 
                 {
                     // If the queue is full, wait up to 10 freeRTOS ticks.
                     xQueueSend(xReturnQueue, &received_data, pdMS_TO_TICKS(0));
                     
-                }
+                }*/
         }
     }
 }
@@ -397,6 +459,13 @@ static void example_touch_do_initial_scanning(touch_sensor_handle_t sens_handle,
 
 void app_main(void)
 {
+    size_t batch_bytes = sizeof(uint32_t) * SAMPLES_PER_BATCH;
+    s_touch_ringbuf = xRingbufferCreate(batch_bytes * RINGBUF_BATCH_COUNT, RINGBUF_TYPE_NOSPLIT);
+    if (s_touch_ringbuf == NULL) {
+        ESP_LOGE(TAG, "Failed to create ring buffer");
+        return;
+    }
+
     // Create a queue capable of holding 1 struct instance at a time
     xConfigQueue = xQueueCreate(1, sizeof(measured_data_t));
 
@@ -466,19 +535,19 @@ void app_main(void)
         "Measurement_task",            // txt name for debugging
         4096,                          // stack size in bytes
         NULL,                          // Parameter passed into the task
-        4,                             // task priority
+        11,                             // task priority
         &Measurement_task_handle,        // task handle, NULL if not needed for tracking
         1                              // core ID (0 or 1)
         );
 
         xTaskCreatePinnedToCore(
         Processing_task,               // fxn to implement task 
-        "Processing_task",            // txt name for debugging
+        "Processing_task",             // txt name for debugging
         4096,                          // stack size in bytes
         NULL,                          // Parameter passed into the task
         5,                             // task priority
-        &Processing_task_handle,                          // task handle, NULL if not needed for tracking
-        0                              // core ID (0 or 1)
+        &Processing_task_handle,       // task handle, NULL if not needed for tracking
+        1                              // core ID (0 or 1)
         ); 
 
     }
@@ -516,15 +585,6 @@ void app_main(void)
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
     gpio_isr_handler_add(BUTTON_GPIO_PIN, button_gpio_isr_handler, NULL);
 
-    
 
-    /* Step8: Print the sampled data of each enabled touch channel */
-    /*uint32_t data[EXAMPLE_TOUCH_SAMPLE_CFG_NUM] = {};
-    while (1) {
-        int i = 0;
-            ESP_ERROR_CHECK(touch_channel_read_data(chan_handle[i], TOUCH_CHAN_DATA_TYPE_RAW, data));
-            int j = 0 ;
-            ESP_LOGI(TAG, "Measd = %d On Channel %d \n", data[j], s_channel_id[i]);
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }*/
+    
 }
