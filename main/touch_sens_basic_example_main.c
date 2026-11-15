@@ -200,36 +200,13 @@ static void button_task(void *pvParameters)
 
 void Measurement_task(void *pvParameters)
 {
-    //measured_data_t read_data;
-    //uint32_t data = 0;       //[EXAMPLE_TOUCH_SAMPLE_CFG_NUM] = {};
-    //struct timeval tv_now;
-    //uint32_t benchmark = 20;
-    //int counts;
+    
     int i = 0;
     //int j = 0;
     //int seq = 1;
 
     
-    //xQueueReceive(xBenchmarkQueue, &benchmark, 0) ;
-    //ESP_LOGI(TAG, " Benchmark = %ld Received via Queue \n", benchmark);
-            
-
-    /*if(touch_channel_read_data(chan_handle[i], TOUCH_CHAN_DATA_TYPE_SMOOTH, &data))
-    {
-        //read_data.baseline = (float)data;
-        read_data.filtered_signal = (float)data;
-        read_data.noise_variance = 4.0f; // Initial guess floor (RMS noise = 2.0)
-        read_data.rms_noise = sqrtf(read_data.noise_variance);
-
-    }
-    read_data.baseline = (float)benchmark;
-    read_data.filtered_signal = (float)benchmark;
-    read_data.noise_variance = 4.0f; // Initial guess floor (RMS noise = 2.0)
-    read_data.rms_noise = sqrtf(read_data.noise_variance);
-    read_data.is_touched = false;
-    read_data.seq_nbr = seq;
-    read_data.timestamp = 0;
-    read_data.raw_data = data;*/
+    
 
     uint32_t batch_buf[SAMPLES_PER_BATCH];
     uint16_t sample_idx = 0;
@@ -353,21 +330,21 @@ void Processing_task(void *pvParameters)
                 }
             }
                 // Telemetry Data Output
-                ESP_LOGI(TAG, "Raw: %4lu |Baseline: %6.1f |Fltrd: %6.1f |ClnSig:%5.1f |RMSNoise: %4.2f |Nbr: %5.1f |at: %lld |[%s]",
-                     data, 
-                     received_data.baseline, 
-                     received_data.filtered_signal,
-                     (received_data.filtered_signal - received_data.baseline), 
-                     received_data.rms_noise,
-                     received_data.seq_nbr,
-                     received_data.timestamp,
-                     received_data.is_touched ? "TOUCHED" : "RELEASED");
+            ESP_LOGI(TAG, "Raw: %4lu |Baseline: %6.1f |Fltrd: %6.1f |ClnSig:%5.1f |RMSNoise: %4.2f |Nbr: %5.1f |at: %lld |[%s]",
+                data, 
+                received_data.baseline, 
+                received_data.filtered_signal,
+                (received_data.filtered_signal - received_data.baseline), 
+                received_data.rms_noise,
+                received_data.seq_nbr,
+                received_data.timestamp,
+                received_data.is_touched ? "TOUCHED" : "RELEASED");
 
             
             
 
 
-            //ESP_LOGI(TAG, " mst nbr %6.1f at %lldms and Value %6.1f \n", received_data.seq_nbr, received_data.timestamp, received_data.filtered_signal);
+                //ESP_LOGI(TAG, " mst nbr %6.1f at %lldms and Value %6.1f \n", received_data.seq_nbr, received_data.timestamp, received_data.filtered_signal);
             
             
                 if (xConfigQueue != NULL) 
@@ -383,11 +360,12 @@ void Processing_task(void *pvParameters)
                     xQueueSend(xReturnQueue, &received_data, pdMS_TO_TICKS(0));
                     
                 }*/
+            vRingbufferReturnItem(s_touch_ringbuf, (void *)batch);
         }
     }
 }
 
-
+/*
 bool example_touch_on_active_callback(touch_sensor_handle_t sens_handle, const touch_active_event_data_t *event, void *user_ctx)
 {
     ESP_EARLY_LOGI("touch_callback", "[CH %d] active  @@@@@@@@@@@@@@@\n", (int)event->chan_id);
@@ -398,7 +376,7 @@ bool example_touch_on_inactive_callback(touch_sensor_handle_t sens_handle, const
 {
     ESP_EARLY_LOGI("touch_callback", "[CH %d] inactive  ###############\n", (int)event->chan_id);
     return false;
-}
+}*/
 
 static void example_touch_do_initial_scanning(touch_sensor_handle_t sens_handle, touch_channel_handle_t chan_handle[])
 {
@@ -514,11 +492,11 @@ void app_main(void)
     example_touch_do_initial_scanning(sens_handle, chan_handle);
 
     /* Step 5: Register the touch sensor callbacks, here only take `active` and `inactive` event for example */
-    touch_event_callbacks_t callbacks = {
+    /*touch_event_callbacks_t callbacks = {
         .on_active = example_touch_on_active_callback,
         .on_inactive = example_touch_on_inactive_callback,
     };
-    ESP_ERROR_CHECK(touch_sensor_register_callbacks(sens_handle, &callbacks, NULL));
+    ESP_ERROR_CHECK(touch_sensor_register_callbacks(sens_handle, &callbacks, NULL));*/
 
     /* Step 6: Enable the touch sensor */
     ESP_ERROR_CHECK(touch_sensor_enable(sens_handle));
