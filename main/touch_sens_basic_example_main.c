@@ -32,11 +32,11 @@
 #define BUTTON_GPIO_PIN     GPIO_NUM_0  // Typically the BOOT button on ESP32 DevKits
 #define ESP_INTR_FLAG_DEFAULT 0
 
-#define SAMPLING_PERIOD_MS    20
+//#define SAMPLING_PERIOD_MS    20
 
 //ring buffer config
 #define SAMPLES_PER_BATCH    256             // 256 samples per ~100 ms window
-#define BATCH_PERIOD_US      100000          // 100 ms
+#define BATCH_PERIOD_US      30000          // 100 ms or 5ms
 #define SAMPLE_PERIOD_US     (BATCH_PERIOD_US / SAMPLES_PER_BATCH) // 390 us (~2.56 kHz)
 #define RINGBUF_BATCH_COUNT  10              // Holds 1 second (10 batches) of data
 
@@ -84,6 +84,7 @@ QueueHandle_t xReturnQueue = NULL;
 //ESP_STATIC_ASSERT(EXAMPLE_TOUCH_CHANNEL_NUM <= (TOUCH_MAX_CHAN_ID - TOUCH_MIN_CHAN_ID + 1), "touch channel number exceed the max supported number ");
 
 static const char* TAG = "Cap_mst";
+static const char* TAG1 = ".....";
 #define BIT_ISR_EVENT   (1 << 0)
 #define BIT_QUEUE_EVENT (1 << 1)
 
@@ -202,6 +203,7 @@ void Measurement_task(void *pvParameters)
 {
     
     int i = 0;
+    uint32_t it = 0;
     //int j = 0;
     //int seq = 1;
 
@@ -242,8 +244,13 @@ void Measurement_task(void *pvParameters)
                 ESP_LOGW(TAG, "Ring buffer full! Consumer task is falling behind");
 
             }
+            for(int i=0; i<SAMPLES_PER_BATCH; i++)
+            {
+                it += batch_buf[i];
+            }
             sample_idx = 0;
-
+            ESP_LOGI(TAG1,"...Ring buffer has been loaded Tot: %lu 1st: %lu last: %lu", it, batch_buf[0], batch_buf[255]);
+            it = 0;
         }
 
     }
@@ -280,6 +287,7 @@ void Processing_task(void *pvParameters)
     {
         uint32_t *batch = (uint32_t *)xRingbufferReceive(s_touch_ringbuf, &item_size, portMAX_DELAY);
 
+        int64_t s_time = esp_timer_get_time();
         if (batch != NULL)
         {
             size_t count = item_size / sizeof(uint32_t);
@@ -361,6 +369,9 @@ void Processing_task(void *pvParameters)
                     
                 }*/
             vRingbufferReturnItem(s_touch_ringbuf, (void *)batch);
+            int64_t p_time = esp_timer_get_time() - s_time ;
+             ESP_LOGI(TAG1,"...Ring buffer has been loaded Processing time: %llu ", p_time);
+            
         }
     }
 }
@@ -489,7 +500,7 @@ void app_main(void)
     /* Step 4: Do the initial scanning to initialize the touch channel data
      * Without this step, the channel data in the first read will be invalid
      */
-    example_touch_do_initial_scanning(sens_handle, chan_handle);
+    //example_touch_do_initial_scanning(sens_handle, chan_handle);
 
     /* Step 5: Register the touch sensor callbacks, here only take `active` and `inactive` event for example */
     /*touch_event_callbacks_t callbacks = {
