@@ -401,7 +401,7 @@ void Processing_task(void *pvParameters)
                     //ESP_LOGI(TAG, "[Core %d] processed %zu samples | first: %lu, Last: %lu", xPortGetCoreID(), count, batch[0], batch[count - 1]);
                     for(int ts = 0; ts < SAMPLES_PER_BATCH; ts++)
                     {
-                        data = sim_raw_buf[ts];
+                        data = raw_buf[c][ts];
                         // 2. Continual IIR Filtering for responsive touch level estimation
                         received_data.filtered_signal = (ALPHA_SIGNAL * data) + ((1.0f - ALPHA_SIGNAL) * received_data.filtered_signal);
 
