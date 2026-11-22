@@ -20,6 +20,7 @@
 #include "freertos/queue.h"
 #include "driver/gpio.h"
 #include "freertos/ringbuf.h"
+#include "string.h"
 
 // Touch version 3 supports multiple sample configurations (i.e. supports frequency hopping),
 // others only have one set of sample configurations.
@@ -39,6 +40,9 @@
 #define BATCH_PERIOD_US      30000          // 100 ms or 5ms
 #define SAMPLE_PERIOD_US     (BATCH_PERIOD_US / SAMPLES_PER_BATCH) // 390 us (~2.56 kHz)
 #define RINGBUF_BATCH_COUNT  10              // Holds 1 second (10 batches) of data
+
+#define SIM_CHANNEL_COUNT       3   // Increase to 3, 7, or 11 to stress-test Core 1
+#define TOTAL_CHANNELS          (1 + SIM_CHANNEL_COUNT)
 
 
 // Signal Processing Hyperparameters
@@ -130,6 +134,21 @@ static void IRAM_ATTR button_gpio_isr_handler(void *arg)
     }
 }
 
+// Helper to synthesize realistic capacitive touch data for simulated channels
+static void generate_simulated_channel(uint32_t *dst, uint8_t sim_idx, uint32_t frame_id) 
+{
+    uint32_t base = 22000 + (sim_idx * 1500);
+    // Inject a simulated touch + 80 Hz oscillation every 20 frames (2 seconds)
+    bool sim_touch_active = ((frame_id / 10) % 4 == (sim_idx % 4));
+    float touch_offset = sim_touch_active ? 1800.0f : 0.0f;
+
+    for (int i = 0; i < 256; i++) {
+        float wave = sim_touch_active ? (400.0f * sinf(2.0f * M_PI * 80.0f * i / 8448)) : 0.0f;
+        float noise = (float)((i * 17 + frame_id) % 40) - 20.0f;
+        dst[i] = (uint32_t)(base + touch_offset + wave + noise);
+    }
+}
+
 // Task handling the button event
 static void button_task(void *pvParameters)
 {
@@ -204,6 +223,7 @@ void Measurement_task(void *pvParameters)
     
     int i = 0;
     uint32_t it = 0;
+    uint32_t rb_overflow = 0;
     //int j = 0;
     //int seq = 1;
 
@@ -241,16 +261,17 @@ void Measurement_task(void *pvParameters)
         {
             BaseType_t sent = xRingbufferSend(s_touch_ringbuf, batch_buf, sizeof(batch_buf), 0);
             if (sent != pdTRUE) {
-                ESP_LOGW(TAG, "Ring buffer full! Consumer task is falling behind");
+                rb_overflow++;
+                ESP_LOGW(TAG, "Ring buffer full! has dropped %lu batches. Consumer task is falling behind", rb_overflow);
 
             }
-            for(int i=0; i<SAMPLES_PER_BATCH; i++)
-            {
-                it += batch_buf[i];
-            }
+            //for(int i=0; i<SAMPLES_PER_BATCH; i++)
+            //{
+            //    it += batch_buf[i];
+            //}
             sample_idx = 0;
-            ESP_LOGI(TAG1,"...Ring buffer has been loaded Tot: %lu 1st: %lu last: %lu", it, batch_buf[0], batch_buf[255]);
-            it = 0;
+            ESP_LOGI(TAG1,"...Ring buffer has been loaded  1st: %lu last: %lu", batch_buf[0], batch_buf[255]);
+            //it = 0;
         }
 
     }
@@ -265,6 +286,9 @@ void Processing_task(void *pvParameters)
     int seq = 1;
     size_t item_size = sizeof(uint32_t) * SAMPLES_PER_BATCH;
     uint32_t data;
+    uint32_t frame_id = 0;
+    static uint32_t sim_raw_buf[SAMPLES_PER_BATCH];
+    static uint32_t raw_buf[SIM_CHANNEL_COUNT][SAMPLES_PER_BATCH];
 
     if(touch_channel_read_data(chan_handle[i], TOUCH_CHAN_DATA_TYPE_SMOOTH, &data))
     {
@@ -282,6 +306,14 @@ void Processing_task(void *pvParameters)
     received_data.seq_nbr = seq;
     received_data.timestamp = 0;
     received_data.raw_data = data;
+
+    for (int c = 0; c < (SIM_CHANNEL_COUNT); c++) 
+    {
+        generate_simulated_channel(sim_raw_buf, c, SAMPLES_PER_BATCH);
+        memcpy(raw_buf[c], sim_raw_buf, sizeof(sim_raw_buf));
+        
+    }
+
 
     while(1)
     {
@@ -348,20 +380,96 @@ void Processing_task(void *pvParameters)
                 received_data.timestamp,
                 received_data.is_touched ? "TOUCHED" : "RELEASED");
 
-            
-            
-
-
-                //ESP_LOGI(TAG, " mst nbr %6.1f at %lldms and Value %6.1f \n", received_data.seq_nbr, received_data.timestamp, received_data.filtered_signal);
-            
-            
-                if (xConfigQueue != NULL) 
+            if (xConfigQueue != NULL) 
                 {
                     // If the queue is full, wait up to 10 freeRTOS ticks.
                     xQueueSend(xConfigQueue, &received_data, pdMS_TO_TICKS(0));
                     // Notify the worker task that data is ready in the queue
                     xTaskNotify(button_task_handle, BIT_QUEUE_EVENT, eSetBits);
                 }
+
+            
+            
+            for (int c = 0; c < (SIM_CHANNEL_COUNT); c++) 
+            {
+                //uint8_t ch_id = 1 + c;
+                //generate_simulated_channel(sim_raw_buf, c, SAMPLES_PER_BATCH);
+                  //process_channel_baseline(ch_id, true, sim_raw_buf, frame_id);
+                  
+                    
+                    size_t count = item_size / sizeof(uint32_t);
+                    //ESP_LOGI(TAG, "[Core %d] processed %zu samples | first: %lu, Last: %lu", xPortGetCoreID(), count, batch[0], batch[count - 1]);
+                    for(int ts = 0; ts < SAMPLES_PER_BATCH; ts++)
+                    {
+                        data = sim_raw_buf[ts];
+                        // 2. Continual IIR Filtering for responsive touch level estimation
+                        received_data.filtered_signal = (ALPHA_SIGNAL * data) + ((1.0f - ALPHA_SIGNAL) * received_data.filtered_signal);
+
+                        // Deviation formula: On ESP32-S3, finger touches INCREASE raw capacitance cycles
+                        float deviation = (float)data - received_data.baseline;
+                        float touch_threshold = NOISE_SIGMA_THRESHOLD * received_data.rms_noise;
+
+                        // 3. Conditional State Machine (Sticky Baseline Logic)
+                        if (deviation > touch_threshold) {
+        
+                            // --- PAD TOUCHED ---
+                            received_data.is_touched = true;
+            
+                         // TARGET CRITERIA: Completely skip updating the baseline here.
+                         // Because this block executes while a finger remains on the sensor, 
+                         // the baseline stays frozen indefinitely, avoiding absorption.
+                        } else 
+                        {
+                            // --- PAD UNTOUCHED / IDLE ---
+                            received_data.is_touched = false;
+
+                            // Handle baseline drift directionally
+                            if (deviation < 0.0f) {
+                                // If raw values fall below baseline, track fast (environmental drop or release recalibration)
+                                received_data.baseline = (ALPHA_BASE_FAST * data) + ((1.0f - ALPHA_BASE_FAST) * received_data.baseline);
+                            } else 
+                            {
+                                // Natural environmental drift tracking
+                                received_data.baseline = (ALPHA_BASE_SLOW * data) + ((1.0f - ALPHA_BASE_SLOW) * received_data.baseline);
+                            }
+
+                            // 4. Update RMS Noise estimation (Variance is only valid when untouched)
+                            float current_variance = deviation * deviation;
+                            received_data.noise_variance = (ALPHA_NOISE * current_variance) + ((1.0f - ALPHA_NOISE) * received_data.noise_variance);
+                
+                            //vTaskDelay(pdMS_TO_TICKS(1));
+
+                            // Guard against noise collapse
+                            if (received_data.noise_variance < 0.25f) received_data.noise_variance = 0.25f;
+                            received_data.rms_noise = sqrtf(received_data.noise_variance);
+                        }
+                    }
+                        // Telemetry Data Output
+                    ESP_LOGI(TAG1, "SIM %lu, Raw: %4lu |Baseline: %6.1f |Fltrd: %6.1f |ClnSig:%5.1f |RMSNoise: %4.2f |Nbr: %5.1f |at: %lld |[%s]",
+                        (c+1),
+                        data, 
+                        received_data.baseline, 
+                        received_data.filtered_signal,
+                        (received_data.filtered_signal - received_data.baseline), 
+                        received_data.rms_noise,
+                        received_data.seq_nbr,
+                        received_data.timestamp,
+                        received_data.is_touched ? "TOUCHED" : "RELEASED");
+            
+
+            }
+
+
+                //ESP_LOGI(TAG, " mst nbr %6.1f at %lldms and Value %6.1f \n", received_data.seq_nbr, received_data.timestamp, received_data.filtered_signal);
+            
+            
+                /*if (xConfigQueue != NULL) 
+                {
+                    // If the queue is full, wait up to 10 freeRTOS ticks.
+                    xQueueSend(xConfigQueue, &received_data, pdMS_TO_TICKS(0));
+                    // Notify the worker task that data is ready in the queue
+                    xTaskNotify(button_task_handle, BIT_QUEUE_EVENT, eSetBits);
+                }*/
              /* if (xReturnQueue != NULL) 
                 {
                     // If the queue is full, wait up to 10 freeRTOS ticks.
@@ -370,7 +478,7 @@ void Processing_task(void *pvParameters)
                 }*/
             vRingbufferReturnItem(s_touch_ringbuf, (void *)batch);
             int64_t p_time = esp_timer_get_time() - s_time ;
-             ESP_LOGI(TAG1,"...Ring buffer has been loaded Processing time: %llu ", p_time);
+             ESP_LOGI(TAG1,"Ring buffer has been computed, Processing time: %llu ", p_time);
             
         }
     }
@@ -563,12 +671,15 @@ void app_main(void)
     gpio_config(&io_conf);
 
     // 2. Create the processing task
-    xTaskCreate(button_task, 
+    xTaskCreatePinnedToCore(
+                button_task, 
                 "button_task", 
                 2048, 
                 NULL, 
                 10,              // High priority to ensure immediate context switch
-                &button_task_handle);
+                &button_task_handle,
+                1
+                );
 
     // 3. Install GPIO ISR service and register the handler
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
